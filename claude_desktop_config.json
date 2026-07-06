@@ -1,0 +1,16 @@
+{
+  "_comment": "示例: 把这段加到 Claude Desktop 的 claude_desktop_config.json (路径见 README)",
+  "_comment2": "Claude Code 用户: 把 web 这一项合到 C:\\Users\\LENOVO\\.claude.json 的 mcpServers 字段",
+  "mcpServers": {
+    "web": {
+      "command": "D:\\桌面\\web-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "web_mcp"],
+      "cwd": "D:\\桌面\\web-mcp",
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "WEB_MCP_PROXY": "http://127.0.0.1:7890"
+      }
+    }
+  }
+}

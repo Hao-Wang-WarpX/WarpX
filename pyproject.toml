@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "web-mcp"
+version = "0.1.0"
+description = "本地 web 访问 MCP server：搜索、抓取（含 JS 渲染）、下载图片"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Lenovo" }]
+keywords = ["mcp", "web", "search", "playwright", "duckduckgo"]
+
+dependencies = [
+    "mcp[cli]>=1.2,<2.0",
+    "httpx[http2]>=0.27,<1.0",
+    "ddgs>=9.0,<10.0",
+    "trafilatura>=1.7,<3.0",
+    "markdownify>=0.13,<1.0",
+    "beautifulsoup4>=4.12,<5.0",
+    "lxml>=5.2,<6.0",
+    "playwright>=1.47,<2.0",
+    "Pillow>=10.4,<12.0",
+    "pydantic>=2.8,<3.0",
+    "pydantic-settings>=2.4,<3.0",
+    "python-dotenv>=1.0,<2.0",
+    "tenacity>=8.5,<10.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+web-mcp = "web_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+web_mcp = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

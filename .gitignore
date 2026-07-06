@@ -1,0 +1,38 @@
+# venv
+.venv/
+venv/
+
+# 配置 (含可能的代理 token)
+.env
+
+# 缓存
+downloads/
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 构建产物
+*.egg-info/
+*.egg
+build/
+dist/
+
+# 测试产物
+.coverage
+htmlcov/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 大型下载
+*.zip
+*.tar.gz
+*.pdf
+
+# 日志
+*.log
