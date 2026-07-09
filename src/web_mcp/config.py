@@ -1,4 +1,7 @@
-"""web-mcp 配置: 用 pydantic-settings 读 .env, 单例导出."""
+"""web-mcp 配置: 用 pydantic-settings 读 .env, 单例导出.
+
+代理自动探测延迟到 lifespan (不阻塞 import / pytest).
+"""
 
 from __future__ import annotations
 
@@ -7,19 +10,25 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# --------------------------------------------------------------------------- #
+# 项目根 & 默认下载目录
+# --------------------------------------------------------------------------- #
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_DOTENV = _PROJECT_ROOT / ".env"
 DEFAULT_DOWNLOAD_DIR = Path("downloads")
 
 
 def _default_download_dir() -> str:
     """默认下载目录: 项目根/downloads (跨平台)."""
-    return str((Path(__file__).resolve().parent.parent.parent / DEFAULT_DOWNLOAD_DIR))
+    return str(_PROJECT_ROOT / DEFAULT_DOWNLOAD_DIR)
 
 
 # --------------------------------------------------------------------------- #
-# 自动代理探测
+# 自动代理探测 (延迟调用, 不阻塞 import)
 # --------------------------------------------------------------------------- #
 
 # (port, fallback scheme). HTTP 协议靠实际探测区分.
@@ -87,9 +96,41 @@ def detect_local_proxy(timeout_per_port: float = 0.6) -> Optional[str]:
     return None
 
 
+def detect_and_set_proxy(settings_obj: "Settings") -> None:
+    """在 lifespan 中调用: 自动探测并回填 proxy.
+
+    仅在 proxy 未显式设置 (None / "") 时生效.
+    打印一行 stderr 告知检测结果, 不污染 stdio JSON-RPC 通道.
+    """
+    proxy = settings_obj.proxy
+    if proxy is not None and proxy != "":
+        return  # 用户已显式设置
+
+    settings_obj.proxy = None  # 清空可能遗留的空串
+    detected = detect_local_proxy()
+    if detected is not None:
+        settings_obj.proxy = detected
+        print(
+            f"[web-mcp] auto-detected proxy: {detected}",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            "[web-mcp] no local proxy detected, using direct connection",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Settings
+# --------------------------------------------------------------------------- #
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_DEFAULT_DOTENV) if _DEFAULT_DOTENV.exists() else None,
         env_prefix="WEB_MCP_",
         case_sensitive=False,
         extra="ignore",
@@ -102,13 +143,17 @@ class Settings(BaseSettings):
         "Chrome/126.0.0.0 Safari/537.36"
     )
     http_timeout: float = Field(30.0, ge=5.0, le=120.0)
-    proxy: Optional[str] = None  # 显式设值时优先; 未设则下面 model_validator 自动探测
+    proxy: Optional[str] = None  # 显式设值时优先; None → lifespan 里自动探测
 
     # Playwright
     browser_timeout: float = Field(45.0, ge=10.0, le=180.0)
     browser_headless: bool = True
     browser_wait_selector: Optional[str] = None
     browser_viewport: str = "1280,720"
+    browser_network_idle_timeout: float = Field(
+        5.0, ge=1.0, le=30.0,
+        description="render 时等 networkidle 最多 N 秒 — SPA 的长轮询可能会一直不 idle",
+    )
 
     # 下载
     download_dir: str = Field(default_factory=_default_download_dir)
@@ -117,6 +162,7 @@ class Settings(BaseSettings):
     # 搜索
     ddg_region: str = "wt-wt"
     ddg_safesearch: str = "moderate"
+    ddg_timeout: float = Field(15.0, ge=5.0, le=60.0, description="DuckDuckGo 搜索超时 (秒)")
 
     @field_validator("ddg_safesearch")
     @classmethod
@@ -124,37 +170,6 @@ class Settings(BaseSettings):
         if v not in ("strict", "moderate", "off"):
             raise ValueError("safesearch must be one of: strict, moderate, off")
         return v
-
-    @model_validator(mode="after")
-    def _autodetect_proxy(self) -> "Settings":
-        """proxy 未设置时扫描本机常见代理端口, 命中第一个就填上.
-
-        "未设置" 指 None 或空字符串 (后者常见: .env 留空 / WEB_MCP_PROXY=).
-
-        行为:
-        - WEB_MCP_PROXY 显式设值 (非空) → 用用户的
-        - WEB_MCP_PROXY 未设 / 留空 → 自动探测 7890/7897/7891/2080/8888/10809/1080
-        - 都没命中 → proxy 保持 None (直连)
-        """
-        if self.proxy is None or self.proxy == "":
-            # 先清回 None, 避免空串透传给下游 httpx/playwright
-            self.proxy = None
-            detected = detect_local_proxy()
-            if detected is not None:
-                self.proxy = detected
-                # stderr 一行, 不污染 stdio JSON-RPC 流
-                print(
-                    f"[web-mcp] auto-detected proxy: {detected}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            else:
-                print(
-                    "[web-mcp] no local proxy detected, using direct connection",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        return self
 
     @property
     def viewport(self) -> dict[str, int]:
@@ -169,4 +184,5 @@ class Settings(BaseSettings):
         return int(self.max_image_size_mb * 1024 * 1024)
 
 
-settings = Settings()  # 全局单例 (此时自动代理探测会跑一次)
+# 模块级单例 — import 很快 (只读 .env + 设默认值, 不扫端口)
+settings = Settings()

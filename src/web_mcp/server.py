@@ -14,8 +14,8 @@ from pydantic import Field
 
 from . import __version__
 from .browser import manager as browser_manager
-from .config import settings
-from .fetch import extract_links, static_fetch
+from .config import detect_and_set_proxy, settings
+from .fetch import close_http_client, extract_links, static_fetch
 from .images import download_image as _download_image
 from .search import ddg_text_search
 from .utils import smart_truncate
@@ -24,22 +24,28 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Lifespan: 启动时启动 Playwright (懒), 退出时确保清理
+# Lifespan: 启动时检测代理 + 初始化 Playwright (懒), 退出时清理
 # --------------------------------------------------------------------------- #
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP):
-    # 启动: 不在这里 launch Playwright (懒, 第一次 render 调用时才启动)
-    logger.info(f"web-mcp v{__version__} starting up")
+    # 启动: 代理探测 + 日志
+    detect_and_set_proxy(settings)
+    logger.info(f"web-mcp v{__version__} starting up (proxy={'set' if settings.proxy else 'direct'})")
     try:
         yield {"manager": browser_manager, "settings": settings}
     finally:
-        logger.info("web-mcp shutting down, closing playwright if started")
+        logger.info("web-mcp shutting down")
+        # 顺序很重要: 先关浏览器, 再关 HTTP client
         try:
             await browser_manager.stop()
         except Exception as e:
             logger.warning(f"playwright stop failed: {e}")
+        try:
+            await close_http_client()
+        except Exception as e:
+            logger.warning(f"http client close failed: {e}")
 
 
 # --------------------------------------------------------------------------- #
@@ -84,6 +90,7 @@ async def web_search(
             max_results=max_results,
             region=region,
             safesearch=safesearch,
+            timeout=settings.ddg_timeout,
         )
         return {
             "query": query,
@@ -128,11 +135,13 @@ async def fetch_url(
             try:
                 rd = await browser_manager.render(url, wait_selector=wait_selector)
                 final_url = rd["final_url"]
-                markdown = rd["markdown"] if include_links else rd["markdown"]
-                # 如果用户不要链接, 用 markdownify 内部已经保留;
-                # 这里简单保留, 因为浏览后的 markdown 难以事后移除链接
+                markdown = rd["markdown"]
                 status = rd["status"]
                 title = rd["title"]
+                # include_links=False: 在 render 输出的 markdown 上后处理
+                if not include_links:
+                    from .fetch import _strip_markdown_links
+                    markdown = _strip_markdown_links(markdown)
             except Exception as e:
                 # 自动降级到静态抓取
                 logger.warning(f"render failed, falling back to static: {e}")
@@ -142,7 +151,12 @@ async def fetch_url(
         else:
             final_url, markdown, status, title = await static_fetch(url)
 
-        # include_links=False 时简单跳过链接提取 (markdown 已经包含了, 这里只影响返回字段)
+        # include_links=False 时静态路径的 trafilatura/markdownify 可能已含链接;
+        # 统一后处理确保一致性.
+        if not include_links:
+            from .fetch import _strip_markdown_links
+            markdown = _strip_markdown_links(markdown)
+
         truncated_md, truncated = smart_truncate(markdown, max_chars)
         links: list[str] = []
         if include_links:
@@ -189,15 +203,12 @@ async def download_image(
 ) -> dict[str, Any]:
     """下载图片到本地, 返回绝对路径. Claude 用 Read(path) 即可看图."""
     try:
-        # 临时覆盖 cfg 里的 max_image_size_mb, 不修改 settings 实例
-        from .config import Settings
-
-        if max_size_mb != settings.max_image_size_mb:
-            effective = Settings(
-                **{**settings.model_dump(), "max_image_size_mb": max_size_mb}
-            )
-        else:
-            effective = settings
+        # 用 model_copy 避免重新跑 pydantic validators
+        effective = (
+            settings
+            if max_size_mb == settings.max_image_size_mb
+            else settings.model_copy(update={"max_image_size_mb": max_size_mb})
+        )
 
         result = await _download_image(url, save_path=save_path, settings=effective)
         # 给 Claude 一句明确指引
@@ -231,6 +242,10 @@ async def search_and_fetch(
     region: str = Field(
         default_factory=lambda: settings.ddg_region, description="DDG region code"
     ),
+    safesearch: str = Field(
+        default_factory=lambda: settings.ddg_safesearch,
+        description="strict / moderate / off",
+    ),
     render: bool = Field(False, description="是否对所有页面用 Playwright 渲染"),
 ) -> dict[str, Any]:
     """一次调用: 搜 → 取前 N 个 → 返回每页 markdown. 单页失败不影响其他页."""
@@ -254,7 +269,8 @@ async def search_and_fetch(
             query=query,
             max_results=max_results,
             region=region,
-            safesearch=settings.ddg_safesearch,
+            safesearch=safesearch,
+            timeout=settings.ddg_timeout,
         )
         urls = [r["href"] for r in results if r.get("href")]
 

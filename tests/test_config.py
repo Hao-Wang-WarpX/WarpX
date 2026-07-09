@@ -10,6 +10,7 @@ from web_mcp.config import (
     Settings,
     _detect_protocol,
     _probe_port_open,
+    detect_and_set_proxy,
     detect_local_proxy,
 )
 
@@ -162,33 +163,41 @@ def test_detect_local_proxy_returns_none_when_nothing(monkeypatch):
 
 
 def test_explicit_proxy_overrides_autodetect(monkeypatch):
-    # 即使有 fake 端口, 显式设值必须优先
+    # 即使有 fake 端口, detect_and_set_proxy 不应覆盖显式值
     with _fake_http_server() as port:
         monkeypatch.setattr(
             "web_mcp.config.PROXY_CANDIDATES", [(port, "http")]
         )
         s = Settings(proxy="http://1.2.3.4:5678")
+        detect_and_set_proxy(s)  # 应该 no-op
         assert s.proxy == "http://1.2.3.4:5678"
 
 
 def test_autodetect_fills_proxy_when_unset(monkeypatch):
+    # 代理检测现在是 lifespan 里显式调用 detect_and_set_proxy(),
+    # 不再隐含在 Settings() 构造里 (避免 import 时 TCP 扫端口)
+    # 注意: .env 里有 WEB_MCP_PROXY= 会产空串, 所以这里显式传 None
     with _fake_http_server() as port:
         monkeypatch.setattr(
             "web_mcp.config.PROXY_CANDIDATES", [(port, "http")]
         )
-        s = Settings()
+        s = Settings(proxy=None)
+        assert s.proxy is None  # Settings() 自己不动 proxy
+        detect_and_set_proxy(s)
         assert s.proxy == f"http://127.0.0.1:{port}"
 
 
 def test_empty_string_proxy_triggers_autodetect(monkeypatch):
     # .env 留空 WEB_MCP_PROXY= 是常见写法, pydantic 解析为 ""
-    # 这种情况也应触发探测
+    # detect_and_set_proxy() 应把空串视为"未设置"
     with _fake_http_server() as port:
         monkeypatch.setattr(
             "web_mcp.config.PROXY_CANDIDATES", [(port, "http")]
         )
         # 通过 __init__ 传空串模拟 .env 留空
         s = Settings(proxy="")
+        assert s.proxy == ""  # Settings() 原封不动保留空串
+        detect_and_set_proxy(s)
         assert s.proxy == f"http://127.0.0.1:{port}"
 
 

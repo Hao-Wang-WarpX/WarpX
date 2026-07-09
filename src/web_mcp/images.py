@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import logging
 from pathlib import Path
 
 import httpx
+import tenacity
 from PIL import Image, UnidentifiedImageError
 
 from .config import Settings, settings as _settings
@@ -23,6 +25,25 @@ SAFE_EXT: dict[str, str] = {
     "image/bmp": ".bmp",
     "image/tiff": ".tiff",
 }
+
+# 共享 client (复用 fetch.py 的, 或者自己建一个)
+_client: httpx.AsyncClient | None = None
+_client_lock = asyncio.Lock()
+
+
+async def _get_client(cfg: Settings) -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        async with _client_lock:
+            if _client is None or _client.is_closed:
+                _client = httpx.AsyncClient(
+                    timeout=cfg.http_timeout,
+                    follow_redirects=True,
+                    proxy=cfg.proxy,
+                    headers={"User-Agent": cfg.user_agent},
+                    limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
+                )
+    return _client
 
 
 async def download_image(
@@ -46,29 +67,32 @@ async def download_image(
     base.mkdir(parents=True, exist_ok=True)
     max_bytes = cfg.max_image_size_bytes
 
-    async with httpx.AsyncClient(
-        timeout=cfg.http_timeout,
-        follow_redirects=True,
-        proxy=cfg.proxy,
-        headers={"User-Agent": cfg.user_agent},
-    ) as client:
-        # 1. HEAD 探测大小 (很多服务器会拒绝 HEAD, 失败就跳过)
-        content_length_hint: int | None = None
-        try:
-            head = await client.head(url)
-            if head.status_code < 400:
-                cl_raw = head.headers.get("content-length")
-                if cl_raw and cl_raw.isdigit():
-                    content_length_hint = int(cl_raw)
-                    if content_length_hint > max_bytes:
-                        raise ValueError(
-                            f"image too large by HEAD: {content_length_hint} "
-                            f"> {max_bytes} bytes"
-                        )
-        except httpx.HTTPError as e:
-            logger.debug(f"HEAD failed (continuing with stream): {e}")
+    client = await _get_client(cfg)
 
-        # 2. 流式下载
+    # 1. HEAD 探测大小 (很多服务器会拒绝 HEAD, 失败就跳过)
+    content_length_hint: int | None = None
+    try:
+        head = await client.head(url)
+        if head.status_code < 400:
+            cl_raw = head.headers.get("content-length")
+            if cl_raw and cl_raw.isdigit():
+                content_length_hint = int(cl_raw)
+                if content_length_hint > max_bytes:
+                    raise ValueError(
+                        f"image too large by HEAD: {content_length_hint} "
+                        f"> {max_bytes} bytes"
+                    )
+    except httpx.HTTPError as e:
+        logger.debug(f"HEAD failed (continuing with stream): {e}")
+
+    # 2. 流式下载 (瞬时故障自动重试最多 2 次)
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(3),
+        wait=tenacity.wait_exponential(multiplier=0.5, min=0.5, max=4),
+        retry=tenacity.retry_if_exception_type(httpx.HTTPError),
+        reraise=True,
+    )
+    async def _do_download() -> bytes:
         buf = io.BytesIO()
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()
@@ -78,7 +102,13 @@ async def download_image(
                         f"image exceeds {cfg.max_image_size_mb}MB during stream"
                     )
                 buf.write(chunk)
-        data = buf.getvalue()
+        return buf.getvalue()
+
+    try:
+        data = await _do_download()
+    except tenacity.RetryError as e:
+        last = e.last_attempt.exception() if e.last_attempt else None
+        raise last or e
 
     # 3. Pillow 验证 + 拿尺寸 + mime
     try:
@@ -124,7 +154,4 @@ async def download_image(
         "width": width,
         "height": height,
         "hash_sha256": sha,
-        "truncated": bool(
-            content_length_hint and content_length_hint > len(data)
-        ),
     }

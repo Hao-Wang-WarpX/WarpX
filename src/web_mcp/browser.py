@@ -5,6 +5,7 @@
 - start() 在 FastMCP lifespan 启动时调用, stop() 在 finally 中调用
 - render() 是 async, 每次新建 page, finally 关闭 page 防泄漏
 - 用 asyncio.Semaphore 限制并发 page 数 (Chromium 内存敏感)
+- _active_renders 计数器 + _stop_event 防止 stop() 和 render() 竞态
 """
 
 from __future__ import annotations
@@ -33,6 +34,10 @@ class BrowserManager:
         self._browser: Browser | None = None
         self._sem = asyncio.Semaphore(max_concurrent_pages)
         self._lock = asyncio.Lock()
+        self._active_renders = 0
+        self._active_renders_event = asyncio.Event()
+        self._active_renders_event.set()  # 0 → 已就绪
+        self._stop_requested = False
 
     async def start(self) -> None:
         """在 lifespan 启动时调用一次. 已启动则幂等返回."""
@@ -49,6 +54,7 @@ class BrowserManager:
                         "--disable-blink-features=AutomationControlled",
                     ],
                 )
+                self._stop_requested = False
                 logger.info("playwright chromium launched")
             except Exception:
                 # 启动失败要清理半成品状态
@@ -67,7 +73,15 @@ class BrowserManager:
                 raise
 
     async def stop(self) -> None:
-        """在 lifespan 退出时调用."""
+        """在 lifespan 退出时调用. 等待活跃 render 完成再关."""
+        async with self._lock:
+            self._stop_requested = True
+        # 在锁外等活跃 render 排空, 避免死锁
+        try:
+            await asyncio.wait_for(self._active_renders_event.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("timed out waiting for active renders to drain")
+
         async with self._lock:
             try:
                 if self._browser and self._browser.is_connected():
@@ -91,7 +105,8 @@ class BrowserManager:
     async def _ensure_browser(self) -> Browser:
         if self._browser is None or not self._browser.is_connected():
             await self.start()
-        assert self._browser is not None
+        if self._browser is None:
+            raise RuntimeError("Browser failed to start — check Playwright/Chromium installation")
         return self._browser
 
     async def render(
@@ -100,74 +115,89 @@ class BrowserManager:
         *,
         wait_selector: str | None = None,
     ) -> dict[str, Any]:
-        """Playwright 渲染 URL, 返回 {html, title, final_url, status}.
+        """Playwright 渲染 URL, 返回 {html, markdown, title, final_url, status}.
 
         异常:
-        - playwright 启动失败/连接断开 -> 抛 RuntimeError, 调用方降级到 static_fetch
+        - playwright 启动失败/连接断开 → 抛 RuntimeError, 调用方降级到 static_fetch
         """
+        if self._stop_requested:
+            raise RuntimeError("BrowserManager is shutting down")
+
+        # 登记活跃 render
+        self._active_renders += 1
+        if self._active_renders == 1:
+            self._active_renders_event.clear()
+
         browser = await self._ensure_browser()
         context: BrowserContext | None = None
         page: Page | None = None
-        async with self._sem:
-            try:
-                context = await browser.new_context(
-                    viewport=_settings.viewport,
-                    user_agent=_settings.user_agent,
-                    proxy={"server": _settings.proxy} if _settings.proxy else None,
-                )
-                page = await context.new_page()
-                # 主导航超时
-                nav_timeout_ms = int(_settings.browser_timeout * 1000)
-                await page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=nav_timeout_ms,
-                )
-                # 可选: 等指定选择器出现
-                if wait_selector or _settings.browser_wait_selector:
-                    sel = wait_selector or _settings.browser_wait_selector
-                    try:
-                        await page.wait_for_selector(sel, timeout=10_000)
-                    except Exception as e:
-                        logger.debug(f"wait_selector {sel!r} timed out: {e}")
-                # 网络空闲多等 5s 让 SPA 跑完
+        try:
+            async with self._sem:
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=5_000)
-                except Exception:
-                    pass
-
-                html = await page.content()
-                title = await page.title()
-                final_url = page.url
-
-                markdown = html_to_markdown(html)
-                return {
-                    "html": html,
-                    "markdown": markdown,
-                    "title": title,
-                    "final_url": final_url,
-                    "status": 200,
-                }
-            except Exception as e:
-                # 连接断开时尝试重启浏览器, 给下一次机会
-                try:
-                    if self._browser and not self._browser.is_connected():
-                        logger.warning("browser disconnected, will restart on next call")
-                        await self.stop()
-                except Exception:
-                    pass
-                raise RuntimeError(f"playwright render failed for {url}: {e}") from e
-            finally:
-                if page:
+                    context = await browser.new_context(
+                        viewport=_settings.viewport,
+                        user_agent=_settings.user_agent,
+                        proxy={"server": _settings.proxy} if _settings.proxy else None,
+                    )
+                    page = await context.new_page()
+                    # 主导航超时
+                    nav_timeout_ms = int(_settings.browser_timeout * 1000)
+                    await page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=nav_timeout_ms,
+                    )
+                    # 可选: 等指定选择器出现
+                    if wait_selector or _settings.browser_wait_selector:
+                        sel = wait_selector or _settings.browser_wait_selector
+                        try:
+                            await page.wait_for_selector(sel, timeout=10_000)
+                        except Exception as e:
+                            logger.debug(f"wait_selector {sel!r} timed out: {e}")
+                    # 网络空闲等待 (可配, SPA 长轮询调短)
+                    idle_ms = int(_settings.browser_network_idle_timeout * 1000)
                     try:
-                        await page.close()
+                        await page.wait_for_load_state("networkidle", timeout=idle_ms)
                     except Exception:
                         pass
-                if context:
+
+                    html = await page.content()
+                    title = await page.title()
+                    final_url = page.url
+
+                    markdown = html_to_markdown(html)
+                    return {
+                        "html": html,
+                        "markdown": markdown,
+                        "title": title,
+                        "final_url": final_url,
+                        "status": 200,
+                    }
+                except Exception as e:
+                    # 连接断开时尝试重启浏览器, 给下一次机会
                     try:
-                        await context.close()
+                        if self._browser and not self._browser.is_connected():
+                            logger.warning("browser disconnected, will restart on next call")
+                            await self.stop()
                     except Exception:
                         pass
+                    raise RuntimeError(f"playwright render failed for {url}: {e}") from e
+                finally:
+                    if page:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+                    if context:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
+        finally:
+            # 无论成败, 一定要注销
+            self._active_renders -= 1
+            if self._active_renders == 0:
+                self._active_renders_event.set()
 
 
 # 模块级单例
