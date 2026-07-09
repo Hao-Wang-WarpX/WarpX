@@ -36,7 +36,7 @@ cd D:\桌面\web-mcp
 编辑 `.env`：
 
 ```bash
-# 走 verge-mihomo 代理
+# 走 verge-mihomo 代理 (留空则自动探测 7890/7897/.../1080)
 WEB_MCP_PROXY=http://127.0.0.1:7890
 
 # 改 DDG region
@@ -44,6 +44,13 @@ WEB_MCP_DDG_REGION=cn-zh
 
 # 改图片大小上限
 WEB_MCP_MAX_IMAGE_SIZE_MB=20
+
+# Playwright 渲染专用
+WEB_MCP_BROWSER_NETWORK_IDLE_TIMEOUT=5    # SPA 长轮询调短
+WEB_MCP_BROWSER_VIEWPORT=1280,720
+
+# 搜索超时
+WEB_MCP_DDG_TIMEOUT=15
 ```
 
 ## 接入 Claude Code
@@ -101,7 +108,7 @@ WEB_MCP_MAX_IMAGE_SIZE_MB=20
 
 ## 已知限制
 
-- **DDG 限流**：连续 50+ 次搜索触发 `RatelimitException`。代码已加重试 3 次 + 指数退避，但仍可能拿到空列表。
+- **DDG 限流**：连续 50+ 次搜索可能触发限流。代码内建 `tenacity` 重试 3 次 + 指数退避 (0.5s → 1s → 2s)，但极端情况仍可能返回空列表。
 - **`x.com` / `linkedin.com` / `facebook.com`**：需要登录态，普通 HTTP 和 Playwright 都拿不到正文。
 - **>10MB 图片直接拒**（按 `WEB_MCP_MAX_IMAGE_SIZE_MB`）。
 - **大文件下载**：流式限制在 `WEB_MCP_MAX_IMAGE_SIZE_MB`。
@@ -117,13 +124,15 @@ D:\桌面\web-mcp\
 ├── requirements.txt
 ├── pyproject.toml
 ├── src\web_mcp\
-│   ├── server.py            # FastMCP + lifespan + 4 个工具
-│   ├── search.py            # ddgs 异步搜索
-│   ├── fetch.py             # httpx + trafilatura + markdownify
-│   ├── browser.py           # Playwright (lifespan 管理)
-│   ├── images.py            # httpx + Pillow 校验 + 哈希去重
-│   ├── config.py            # pydantic-settings
-│   └── utils.py             # smart_truncate
+│   ├── __init__.py           # 包描述 + __version__
+│   ├── __main__.py           # `python -m web_mcp` 入口
+│   ├── server.py             # FastMCP + lifespan + 4 个工具
+│   ├── search.py             # ddgs 异步搜索 + tenacity 重试
+│   ├── fetch.py              # httpx + trafilatura + markdownify
+│   ├── browser.py            # Playwright (lifespan 管理)
+│   ├── images.py             # httpx + Pillow 校验 + SHA-256 去重
+│   ├── config.py             # pydantic-settings + 代理自动探测
+│   └── utils.py              # smart_truncate
 ├── tests\
 │   └── ...                  # 离线单元测试
 └── downloads\               # 默认图片保存目录
